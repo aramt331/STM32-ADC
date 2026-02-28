@@ -1,0 +1,357 @@
+subtask 2 : 
+code for polling mode : 
+// main.c
+uint32_t raw;
+float voltage;
+
+while (1) {
+    HAL_ADC_Start(&hadc1);
+    HAL_ADC_PollForConversion(&hadc1, HAL_MAX_DELAY);
+    raw = HAL_ADC_GetValue(&hadc1);
+    voltage = (raw / 4095.0f) * 3.3f;
+    
+    printf("Raw: %lu | Voltage: %.2fV\r\n", raw, voltage);
+    HAL_Delay(200);  // read 5 times per second
+}
+
+## Line by Line
+
+**`uint32_t raw`**
+Variable to store the number the ADC gives you. 32 bit unsigned integer because ADC values are always positive and go up to 4095.
+
+---
+
+**`float voltage`**
+Variable to store the converted voltage. Float because 1.76V needs a decimal point.
+
+---
+
+**`HAL_ADC_Start(&hadc1)`**
+Tells the ADC to begin converting. Without this the ADC just sits there doing nothing. You pass it the address of your ADC handle which contains all the configuration CubeMX set up.
+
+---
+
+**`HAL_ADC_PollForConversion(&hadc1, HAL_MAX_DELAY)`**
+This is the blocking wait. CPU stops here and keeps checking internally "is the conversion done yet" in a loop until the EOC flag is set. HAL_MAX_DELAY means wait forever until it's done — you can replace it with a number in milliseconds like 10 if you want a timeout.
+
+---
+
+**`raw = HAL_ADC_GetValue(&hadc1)`**
+Conversion is done. Read the result out of the ADC data register and store it in raw. This gives you a number between 0 and 4095.
+
+---
+
+**`voltage = (raw / 4095.0f) * 3.3f`**
+Convert the raw number to actual voltage.
+- Divide by 4095.0f to get a ratio between 0 and 1
+- Multiply by 3.3f to scale to your reference voltage
+- The f after the numbers tells the compiler to treat them as float not integer — without it the division gets truncated and you get wrong results
+
+---
+
+**`printf(...)`**
+Print the values over UART so you can see them in a serial monitor. %lu is for uint32_t, %.2f is for float with 2 decimal places.
+
+---
+
+**`HAL_Delay(200)`**
+Wait 200 milliseconds before the next reading. Without this it would read as fast as possible — thousands of times per second — and your serial monitor would be unreadable. 200ms means 5 readings per second which is comfortable to watch.
+
+---
+
+## The Flow Every Loop Iteration
+```
+Start ADC → CPU blocks waiting → conversion done → 
+read result → convert to voltage → print → wait 200ms → repeat
+
+hadc1 is a struct that has all the configuration and info for ADC1
+
+Think of it as the ADC's identity card. It holds everything about ADC1 — which instance it is, what resolution, what mode, what channel, current state, error codes. Everything.
+When you call any HAL ADC function you pass &hadc1 to it so the function knows which ADC you're talking about and what its configuration is.
+cHAL_ADC_Start(&hadc1);        // start THIS adc with THIS config
+HAL_ADC_GetValue(&hadc1);     // get value from THIS adc
+The & means you're passing the address of the struct — because HAL functions need to be able to read and modify its internal state directly.
+If you had two ADCs you'd have hadc1 and hadc2 and you'd pass whichever one you want to talk to.
+You never create or fill this struct manually. CubeMX writes all that code for you in adc.c inside the MX_ADC1_Init() function. Every setting you clicked in CubeMX — resolution, channel, mode — gets translated into fields inside hadc1 by that init function.
+You just use it.
+
+
+
+Interrupt mode : 
+volatile uint32_t adc_raw = 0;
+volatile uint8_t  adc_ready = 0;
+
+int main(void) {
+    HAL_ADC_Start_IT(&hadc1);
+    
+    while (1) {
+        if (adc_ready) {
+            adc_ready = 0;
+            float voltage = (adc_raw / 4095.0f) * 3.3f;
+            printf("Voltage: %.2fV\r\n", voltage);
+        }
+    }
+}
+
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
+    if (hadc->Instance == ADC1) {
+        adc_raw   = HAL_ADC_GetValue(hadc);
+        adc_ready = 1;
+        HAL_ADC_Start_IT(hadc);
+    }
+}
+```
+
+---
+
+## Line by Line
+
+**`volatile uint32_t adc_raw = 0`**
+Stores the ADC result. Same as polling but with `volatile` added.
+
+---
+
+**`volatile uint8_t adc_ready = 0`**
+A flag. 0 means no new data. 1 means new data is ready to process.
+
+---
+
+**Why volatile?**
+This is critical. Both variables are shared between main and the ISR callback. Without `volatile` the compiler sees that main never changes `adc_raw` or `adc_ready` itself and assumes they never change — so it optimizes them into a register and never re-reads from memory. Your `if (adc_ready)` would never trigger even though the ISR is setting it to 1.
+
+`volatile` tells the compiler — always read this from actual memory, never cache it, it can change at any time from outside your current execution context.
+
+---
+
+**`HAL_ADC_Start_IT(&hadc1)`**
+Start the ADC with interrupts enabled. Same as `HAL_ADC_Start` in polling but now when conversion finishes instead of setting a flag you manually check, the hardware fires an interrupt automatically. Called once, outside the loop.
+
+---
+
+**`while (1)`**
+Main loop runs forever. CPU is free here — not blocked waiting like in polling.
+
+---
+
+**`if (adc_ready)`**
+Check if the ISR has flagged that new data is available. If nobody has turned the flag on the CPU just keeps looping doing nothing — but it's free to do other work here unlike polling.
+
+---
+
+**`adc_ready = 0`**
+Clear the flag immediately before processing. You do this first before processing — not after — so if another interrupt fires while you're processing you don't accidentally miss it.
+
+---
+
+**`float voltage = (adc_raw / 4095.0f) * 3.3f`**
+Same math as polling. Convert raw number to voltage.
+
+---
+
+**`printf(...)`**
+Print over UART. Same as polling.
+
+---
+
+**`void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)`**
+This is the ISR callback. HAL calls this automatically when ADC conversion completes. You never call this yourself — the hardware triggers it. The name must be exactly this — HAL looks for this exact function name.
+
+---
+
+**`if (hadc->Instance == ADC1)`**
+Safety check. If you have multiple ADCs they all share the same callback. This checks that the interrupt came specifically from ADC1 not ADC2 or ADC3.
+
+---
+
+**`adc_raw = HAL_ADC_GetValue(hadc)`**
+Read the result immediately inside the ISR and store it. You must read it here before the next conversion overwrites it.
+
+---
+
+**`adc_ready = 1`**
+Set the flag to tell main loop that fresh data is waiting.
+
+---
+
+**`HAL_ADC_Start_IT(hadc)`**
+Retrigger the ADC for the next conversion. Because you're in Single Conversion Mode the ADC stops after each conversion — you have to restart it manually each time. If you forget this line you get exactly one reading and then nothing ever again.
+
+---
+
+## The Flow
+```
+main starts ADC with IT
+    ↓
+CPU loops freely in while(1)
+    ↓
+ADC finishes conversion → hardware fires interrupt
+    ↓
+ISR runs → reads value → sets flag → restarts ADC
+    ↓
+main sees flag → processes value → clears flag
+    ↓
+CPU loops freely again
+    ↓
+repeat
+
+DMA:
+
+c#define BUF_SIZE 64
+uint16_t adc_buf[BUF_SIZE];
+volatile uint8_t process_lower = 0;
+volatile uint8_t process_upper = 0;
+
+int main(void) {
+    HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buf, BUF_SIZE);
+    
+    while (1) {
+        if (process_lower) {
+            process_lower = 0;
+            uint32_t sum = 0;
+            for (int i = 0; i < BUF_SIZE/2; i++)
+                sum += adc_buf[i];
+            float avg_voltage = ((sum / (BUF_SIZE/2)) / 4095.0f) * 3.3f;
+            printf("Avg Voltage: %.2fV\r\n", avg_voltage);
+        }
+
+        if (process_upper) {
+            process_upper = 0;
+            uint32_t sum = 0;
+            for (int i = BUF_SIZE/2; i < BUF_SIZE; i++)
+                sum += adc_buf[i];
+            float avg_voltage = ((sum / (BUF_SIZE/2)) / 4095.0f) * 3.3f;
+            printf("Avg Voltage: %.2fV\r\n", avg_voltage);
+        }
+    }
+}
+
+void HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef *hadc) {
+    if (hadc->Instance == ADC1)
+        process_lower = 1;
+}
+
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
+    if (hadc->Instance == ADC1)
+        process_upper = 1;
+}
+
+Line by Line
+#define BUF_SIZE 64
+Define the buffer size as 64 samples. This means DMA will collect 64 ADC readings before notifying you. Not a variable — a compile time constant. Change this one number and it updates everywhere automatically.
+
+uint16_t adc_buf[BUF_SIZE]
+The buffer where DMA drops the ADC results. uint16_t because ADC results are 12 bit — they fit in 16 bits. This array sits in RAM and DMA writes directly into it without CPU involvement.
+Notice there is no volatile here. The CPU never checks this in a condition like the flags — it just reads the values when told to by the flags. So volatile is not needed on the buffer itself.
+
+volatile uint8_t process_lower = 0
+volatile uint8_t process_upper = 0
+Two flags. Same concept as interrupt mode. Volatile because they're shared between callbacks and main. process_lower means first half of buffer is ready. process_upper means second half is ready.
+
+HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_buf, BUF_SIZE)
+Start the ADC with DMA. Three arguments:
+
+&hadc1 — which ADC
+(uint32_t*)adc_buf — where to put the data. DMA expects a uint32_t pointer so you cast your uint16_t buffer to uint32_t. The data itself is still 16 bit — this is just a pointer type requirement from HAL
+BUF_SIZE — how many transfers before firing the complete callback
+
+Called once. Never called again. DMA runs forever in circular mode on its own.
+
+The while(1) loop
+CPU is completely free here. No blocking, no waiting, no ISR overhead per sample. Just checking two flags.
+
+if (process_lower)
+First half of the buffer is full. Safe to read adc_buf[0] through adc_buf[31] because DMA is currently filling the second half — it won't touch the first half until the second half is done.
+
+process_lower = 0
+Clear the flag immediately. Same reason as interrupt mode — clear before processing not after.
+
+The for loop — averaging
+cuint32_t sum = 0;
+for (int i = 0; i < BUF_SIZE/2; i++)
+    sum += adc_buf[i];
+float avg_voltage = ((sum / (BUF_SIZE/2)) / 4095.0f) * 3.3f;
+```
+Add up all 32 samples in the lower half. Divide by 32 to get the average. Then convert to voltage. Averaging multiple samples gives you a smoother more stable reading than a single sample — noise cancels out across samples.
+
+---
+
+**`if (process_upper)`**
+Second half of buffer is full. Safe to read `adc_buf[32]` through `adc_buf[63]`. DMA has wrapped around and is now filling the first half again.
+
+---
+
+**`void HAL_ADC_ConvHalfCpltCallback`**
+HAL calls this automatically when DMA finishes filling the first half of the buffer. Half Complete callback. You just set the flag and leave immediately — no processing here.
+
+---
+
+**`void HAL_ADC_ConvCpltCallback`**
+HAL calls this automatically when DMA finishes filling the entire buffer — meaning the second half is now complete. You set the upper flag and leave.
+
+---
+
+## How the Buffer Fills Over Time
+```
+DMA filling →  [0  1  2 ... 31 | 32 33 34 ... 63]
+                   lower half  |    upper half
+
+Step 1: DMA fills lower half [0..31]
+        → HalfCplt fires → process_lower = 1
+        → main processes lower half
+
+Step 2: DMA fills upper half [32..63]
+        → ConvCplt fires → process_upper = 1
+        → main processes upper half
+
+Step 3: DMA wraps back to start → fills lower half again
+        → repeat forever
+```
+
+---
+
+## Why Two Callbacks and Not One
+
+This is the double buffer pattern. While DMA is writing to one half you are safely reading the other half. They never collide.
+
+If you only used ConvCpltCallback — waited for the entire buffer to fill before processing — DMA would immediately start overwriting from the beginning while you're still reading. You'd get corrupted data.
+
+Two callbacks means you always have one half to process while DMA fills the other. Zero data loss.
+
+---
+
+## The Big Picture Difference From Polling and Interrupt
+```
+Polling:   you drive everything manually. CPU blocked every conversion.
+
+Interrupt: ADC notifies you every single conversion. CPU free between 
+           conversions but gets interrupted constantly at high rates.
+
+DMA:       hardware moves data automatically. CPU only wakes up every
+           32 samples. Scales to any speed without CPU overhead.
+DMA doesn't care if you're sampling at 100Hz or 1MHz. The CPU involvement is identical — just two flag checks per buffer. That's why DMA is the professional default for any serious ADC work.
+
+
+Yes the buffer has multiple readings in it — that's the whole point of DMA.
+Every single time the ADC completes one conversion, DMA copies that one result into the next slot in the array. So with BUF_SIZE 64 you have 64 individual ADC readings sitting in that array.
+adc_buf[0]  = first reading
+adc_buf[1]  = second reading
+adc_buf[2]  = third reading
+...
+adc_buf[63] = 64th reading
+Each one is a separate snapshot of the potentiometer voltage at a slightly different moment in time. DMA collected all 64 without the CPU doing anything.
+
+Why Two Halves
+This is the critical question. Imagine you only used one callback — wait for all 64 slots to fill then process.
+DMA fills [0..63] → callback fires → you start processing
+But here is the problem. DMA in circular mode does not stop. The moment it finishes slot 63 it immediately jumps back to slot 0 and starts overwriting.
+You are reading  adc_buf[0]   ← trying to process this
+DMA is writing   adc_buf[0]   ← overwriting it at the same time
+That's a data collision. You're reading stale or half-written data. Your results are garbage.
+The two halves fix this by making sure DMA and CPU are always working on different sections simultaneously.
+DMA filling upper half [32..63]
+CPU processing lower half [0..31]   ← completely safe, DMA not touching this
+        ↓
+DMA filling lower half [0..31]
+CPU processing upper half [32..63]  ← completely safe, DMA not touching this
+They never touch the same memory at the same time. That's the entire point. While one half is being written the other half is frozen and safe to read.
+It is like two buckets. One is being filled with water while you drink from the other. By the time you finish drinking the other bucket is full and ready.
